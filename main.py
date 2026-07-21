@@ -1,16 +1,41 @@
 import requests
 from bs4 import BeautifulSoup
-import csv
 import time
 import os
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, DuplicateKeyError
 
 # --- Configuration ---
 
-base_url = "http://books.toscrape.com/catalogue/page-{}.html"
-progress_file = "progress.txt"  # tracks the last successfully scraped page
-csv_file = "books_data.csv"
+load_dotenv()  # loads variables from .env into the environment
 
-# Maps the star-rating CSS class word to its integer equivalent
+base_url = "http://books.toscrape.com/catalogue/page-{}.html"
+progress_file = "progress.txt"
+
+# --- MongoDB connection ---
+
+mongo_uri = os.getenv("MONGO_URI")
+
+if not mongo_uri:
+    print("Error: MONGO_URI is not set. Create a .env file with your MongoDB connection string.")
+    print("See .env.example for the required format.")
+    exit(1)
+
+try:
+    client = MongoClient(mongo_uri)
+    client.admin.command("ping")  # verify the connection is reachable
+    print("Connected to MongoDB Atlas successfully.")
+except ConnectionFailure as e:
+    print(f"Could not connect to MongoDB: {e}")
+    exit(1)
+
+db = client["books_scraper"]        # database name
+collection = db["books"]            # collection name (like a "table")
+
+# NEW: make sure "upc" can never be duplicated in this collection
+collection.create_index("upc", unique=True)
+
 rating_map = {
     "One": 1,
     "Two": 2,
@@ -21,7 +46,7 @@ rating_map = {
 
 all_books = []
 
-# --- Determine starting page (supports resume on interrupted runs) ---
+# ---- Figure out where to start from ----
 
 start_page = 1
 
@@ -32,25 +57,13 @@ if os.path.exists(progress_file):
         start_page = int(last_completed) + 1
         print(f"Resuming from page {start_page}")
     except ValueError:
-        start_page = 1  # corrupted or empty progress file; restart from page 1
-
-# --- Early exit if the full catalogue has already been scraped ---
+        start_page = 1
 
 if start_page > 50:
     print("All 50 pages already scraped. Nothing to do.")
     exit()
 
-# --- Initialise the CSV file with headers if it doesn't exist yet ---
-
-file_already_exists = os.path.exists(csv_file)
-fieldnames = ["title", "price_gbp", "availability", "rating", "genre", "upc", "url"]
-
-if not file_already_exists:
-    with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-# --- Scrape each listing page and visit individual book pages for full details ---
+# ---- Loop through pages ----
 
 for page in range(start_page, 51):
     url = base_url.format(page)
@@ -58,7 +71,6 @@ for page in range(start_page, 51):
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        response.encoding = "utf-8"  # force correct decoding; prevents £ being read as Â£
     except requests.exceptions.RequestException as e:
         print(f"Could not load page {page}: {e}")
         continue
@@ -66,7 +78,7 @@ for page in range(start_page, 51):
     soup = BeautifulSoup(response.text, "html.parser")
     books = soup.find_all("article", class_="product_pod")
 
-    page_books = []  # holds results for this page before writing to CSV
+    page_books = []
 
     for book in books:
         try:
@@ -82,7 +94,7 @@ for page in range(start_page, 51):
             if rating_word in rating_map:
                 rating = rating_map[rating_word]
             else:
-                rating = 0  # fallback for any unrecognised rating class
+                rating = 0
 
             relative_link = book.h3.a['href']
             book_url = "http://books.toscrape.com/catalogue/" + relative_link.replace("../../../", "")
@@ -94,17 +106,15 @@ for page in range(start_page, 51):
         genre = "Unknown"
         upc = "Unknown"
 
-        # Visit the book's detail page to extract genre and UPC
         try:
             detail_response = requests.get(book_url, timeout=10)
             detail_response.raise_for_status()
-            detail_response.encoding = "utf-8"  # same encoding fix for detail pages
             detail_soup = BeautifulSoup(detail_response.text, "html.parser")
 
             breadcrumb = detail_soup.find("ul", class_="breadcrumb")
             crumbs = breadcrumb.find_all("li")
             if len(crumbs) >= 3:
-                genre = crumbs[2].text.strip()  # breadcrumb: Home > Books > <Genre> > Title
+                genre = crumbs[2].text.strip()
 
             table_rows = detail_soup.find_all("tr")
             if len(table_rows) > 0:
@@ -125,19 +135,20 @@ for page in range(start_page, 51):
             "url": book_url
         })
 
-    # Append this page's results to the CSV immediately to avoid data loss on interruption
-    with open(csv_file, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        for book in page_books:
-            writer.writerow(book)
+    # ---- NEW: insert this page's books into MongoDB, skip duplicates ----
+    for book in page_books:
+        try:
+            collection.insert_one(book)
+        except DuplicateKeyError:
+            print(f"'{book['title']}' already in database, skipping.")
 
     all_books.extend(page_books)
 
-    # Record progress so the next run can resume from the following page
     with open(progress_file, "w") as f:
         f.write(str(page))
 
     print(f"Page {page} done. Total books collected so far: {len(all_books)}")
-    time.sleep(1)  # brief delay to avoid hammering the server
+    time.sleep(1)
 
 print(f"Done! Scraped {len(all_books)} books this run.")
+print(f"Total books now in database: {collection.count_documents({})}")
